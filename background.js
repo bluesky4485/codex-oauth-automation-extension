@@ -519,6 +519,35 @@ async function sendToContentScript(source, message) {
   return chrome.tabs.sendMessage(entry.tabId, message);
 }
 
+async function sendToContentScriptResilient(source, message, options = {}) {
+  const { timeoutMs = 30000, retryDelayMs = 600, logMessage = '' } = options;
+  const start = Date.now();
+  let lastError = null;
+  let logged = false;
+
+  while (Date.now() - start < timeoutMs) {
+    throwIfStopped();
+
+    try {
+      return await sendToContentScript(source, message);
+    } catch (err) {
+      if (!isRetryableContentScriptTransportError(err)) {
+        throw err;
+      }
+
+      lastError = err;
+      if (logMessage && !logged) {
+        await addLog(logMessage, 'warn');
+        logged = true;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+    }
+  }
+
+  throw lastError || new Error(`等待 ${getSourceLabel(source)} 重新就绪超时。`);
+}
+
 // ============================================================
 // Logging
 // ============================================================
@@ -567,6 +596,11 @@ async function setStepStatus(step, status) {
 function isStopError(error) {
   const message = typeof error === 'string' ? error : error?.message;
   return message === STOP_ERROR_MESSAGE;
+}
+
+function isRetryableContentScriptTransportError(error) {
+  const message = String(typeof error === 'string' ? error : error?.message || '');
+  return /back\/forward cache|message channel is closed|Receiving end does not exist|port closed before a response was received|A listener indicated an asynchronous response/i.test(message);
 }
 
 function isStepDoneStatus(status) {
@@ -1772,12 +1806,20 @@ async function executeStep4(state) {
 
   await chrome.tabs.update(signupTabId, { active: true });
   await addLog('步骤 4：正在确认注册验证码页面是否就绪，必要时自动恢复密码页超时报错...');
-  const prepareResult = await sendToContentScript('signup-page', {
-    type: 'PREPARE_SIGNUP_VERIFICATION',
-    step: 4,
-    source: 'background',
-    payload: { password: state.password || state.customPassword || '' },
-  });
+  const prepareResult = await sendToContentScriptResilient(
+    'signup-page',
+    {
+      type: 'PREPARE_SIGNUP_VERIFICATION',
+      step: 4,
+      source: 'background',
+      payload: { password: state.password || state.customPassword || '' },
+    },
+    {
+      timeoutMs: 30000,
+      retryDelayMs: 700,
+      logMessage: '步骤 4：认证页正在切换，等待页面重新就绪后继续检测...',
+    }
+  );
 
   if (prepareResult && prepareResult.error) {
     throw new Error(prepareResult.error);

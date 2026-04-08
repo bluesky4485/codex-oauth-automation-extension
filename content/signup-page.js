@@ -570,15 +570,15 @@ function getSignupPasswordInput() {
   return input && isVisibleElement(input) ? input : null;
 }
 
-function getSignupPasswordSubmitButton() {
+function getSignupPasswordSubmitButton({ allowDisabled = false } = {}) {
   const direct = document.querySelector('button[type="submit"]');
-  if (direct && isVisibleElement(direct) && isActionEnabled(direct)) {
+  if (direct && isVisibleElement(direct) && (allowDisabled || isActionEnabled(direct))) {
     return direct;
   }
 
   const candidates = document.querySelectorAll('button, [role="button"]');
   return Array.from(candidates).find((el) => {
-    if (!isVisibleElement(el) || !isActionEnabled(el)) return false;
+    if (!isVisibleElement(el) || (!allowDisabled && !isActionEnabled(el))) return false;
     const text = getActionText(el);
     return /继续|continue|submit|创建|create/i.test(text);
   }) || null;
@@ -609,69 +609,116 @@ function isSignupPasswordErrorPage() {
   );
 }
 
-async function prepareSignupVerificationFlow(payload = {}, timeout = 30000) {
-  const { password } = payload;
+function inspectSignupVerificationState() {
+  if (isStep5Ready()) {
+    return { state: 'step5' };
+  }
+
+  if (isVerificationPageStillVisible()) {
+    return { state: 'verification' };
+  }
+
+  if (isSignupPasswordErrorPage()) {
+    return {
+      state: 'error',
+      retryButton: getSignupRetryButton(),
+    };
+  }
+
+  const passwordInput = getSignupPasswordInput();
+  if (passwordInput) {
+    return {
+      state: 'password',
+      passwordInput,
+      submitButton: getSignupPasswordSubmitButton({ allowDisabled: true }),
+    };
+  }
+
+  return { state: 'unknown' };
+}
+
+async function waitForSignupVerificationTransition(timeout = 5000) {
   const start = Date.now();
-  let retried = 0;
-  let lastSubmitAt = 0;
 
   while (Date.now() - start < timeout) {
     throwIfStopped();
 
-    if (isStep5Ready()) {
-      log('步骤 4：页面已进入验证码后的下一阶段，本步骤按已完成处理。', 'ok');
-      return { ready: true, alreadyVerified: true, retried };
-    }
-
-    if (isVerificationPageStillVisible()) {
-      log(`步骤 4：验证码页面已就绪${retried ? `（期间自动重试 ${retried} 次）` : ''}。`, 'ok');
-      return { ready: true, retried };
-    }
-
-    if (isSignupPasswordErrorPage()) {
-      const retryBtn = getSignupRetryButton();
-      if (!retryBtn) {
-        throw new Error('检测到密码页超时报错，但未找到可点击的“重试”按钮。URL: ' + location.href);
-      }
-      retried += 1;
-      log(`步骤 4：检测到密码页超时报错，正在点击“重试”（第 ${retried} 次）...`, 'warn');
-      await humanPause(350, 900);
-      simulateClick(retryBtn);
-      await sleep(1500);
-      continue;
-    }
-
-    const passwordInput = getSignupPasswordInput();
-    if (passwordInput) {
-      if (!password) {
-        throw new Error('当前回到了密码页，但没有可用密码，无法自动重新提交。');
-      }
-
-      if ((passwordInput.value || '') !== password) {
-        log('步骤 4：已回到密码页，正在重新填写密码...', 'warn');
-        await humanPause(450, 1100);
-        fillInput(passwordInput, password);
-      }
-
-      const submitBtn = getSignupPasswordSubmitButton();
-      if (!submitBtn) {
-        throw new Error('密码页存在，但未找到“继续”提交按钮。URL: ' + location.href);
-      }
-
-      if (Date.now() - lastSubmitAt > 1800) {
-        log('步骤 4：正在重新提交密码，等待验证码页面...', 'warn');
-        lastSubmitAt = Date.now();
-        await humanPause(350, 900);
-        simulateClick(submitBtn);
-        await sleep(1800);
-        continue;
-      }
+    const snapshot = inspectSignupVerificationState();
+    if (snapshot.state === 'step5' || snapshot.state === 'verification' || snapshot.state === 'error') {
+      return snapshot;
     }
 
     await sleep(200);
   }
 
-  throw new Error('等待注册验证码页面就绪超时。URL: ' + location.href);
+  return inspectSignupVerificationState();
+}
+
+async function prepareSignupVerificationFlow(payload = {}, timeout = 30000) {
+  const { password } = payload;
+  const start = Date.now();
+  let recoveryRound = 0;
+  const maxRecoveryRounds = 3;
+
+  while (Date.now() - start < timeout && recoveryRound < maxRecoveryRounds) {
+    throwIfStopped();
+
+    const roundNo = recoveryRound + 1;
+    log(`步骤 4：等待页面进入验证码阶段（第 ${roundNo}/${maxRecoveryRounds} 轮，先等待 5 秒）...`, 'info');
+    const snapshot = await waitForSignupVerificationTransition(5000);
+
+    if (snapshot.state === 'step5') {
+      log('步骤 4：页面已进入验证码后的下一阶段，本步骤按已完成处理。', 'ok');
+      return { ready: true, alreadyVerified: true, retried: recoveryRound };
+    }
+
+    if (snapshot.state === 'verification') {
+      log(`步骤 4：验证码页面已就绪${recoveryRound ? `（期间自动恢复 ${recoveryRound} 次）` : ''}。`, 'ok');
+      return { ready: true, retried: recoveryRound };
+    }
+
+    recoveryRound += 1;
+
+    if (snapshot.state === 'error') {
+      if (snapshot.retryButton && isActionEnabled(snapshot.retryButton)) {
+        log(`步骤 4：检测到密码页超时报错，正在点击“重试”（第 ${recoveryRound}/${maxRecoveryRounds} 次）...`, 'warn');
+        await humanPause(350, 900);
+        simulateClick(snapshot.retryButton);
+        await sleep(1200);
+        continue;
+      }
+
+      log(`步骤 4：检测到异常页，但“重试”按钮暂不可用，准备继续等待（${recoveryRound}/${maxRecoveryRounds}）...`, 'warn');
+      continue;
+    }
+
+    if (snapshot.state === 'password') {
+      if (!password) {
+        throw new Error('当前回到了密码页，但没有可用密码，无法自动重新提交。');
+      }
+
+      if ((snapshot.passwordInput.value || '') !== password) {
+        log('步骤 4：页面仍停留在密码页，正在重新填写密码...', 'warn');
+        await humanPause(450, 1100);
+        fillInput(snapshot.passwordInput, password);
+      }
+
+      if (snapshot.submitButton && isActionEnabled(snapshot.submitButton)) {
+        log(`步骤 4：页面仍停留在密码页，正在重新点击“继续”（第 ${recoveryRound}/${maxRecoveryRounds} 次）...`, 'warn');
+        await humanPause(350, 900);
+        simulateClick(snapshot.submitButton);
+        await sleep(1200);
+        continue;
+      }
+
+      log(`步骤 4：页面仍停留在密码页，但“继续”按钮暂不可用，准备继续等待（${recoveryRound}/${maxRecoveryRounds}）...`, 'warn');
+      continue;
+    }
+
+    log(`步骤 4：页面仍在切换中，准备继续等待（${recoveryRound}/${maxRecoveryRounds}）...`, 'warn');
+  }
+
+  throw new Error(`等待注册验证码页面就绪超时或自动恢复失败（已尝试 ${recoveryRound}/${maxRecoveryRounds} 轮）。URL: ${location.href}`);
 }
 
 
